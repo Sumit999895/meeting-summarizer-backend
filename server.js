@@ -3,8 +3,9 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
-import nodemailer from "nodemailer"; // Import nodemailer
+import nodemailer from "nodemailer";
 import bodyParser from "body-parser";
+import fetch from "node-fetch"; // Import fetch for streaming
 
 dotenv.config();
 const apiKey = process.env.GROQ_API_KEY;
@@ -16,22 +17,19 @@ app.use(cors());
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Configure Nodemailer transporter
-// You will need to use your own email credentials and app password.
 const transporter = nodemailer.createTransport({
-  service: "gmail", // You can use other services like 'Outlook365' or 'SendGrid'
+  service: "gmail",
   auth: {
-    user: process.env.EMAIL_USER, // Your email address from .env
-    pass: process.env.EMAIL_PASS, // Your App Password from .env
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
   },
 });
 
-// Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Summarize route
+// Summarize route (UPDATED FOR STREAMING)
 app.post("/api/summarize-form", async (req, res) => {
   try {
     const { text, instruction } = req.body;
@@ -44,35 +42,68 @@ app.post("/api/summarize-form", async (req, res) => {
 
     const userPrompt = `Summarize the following transcript in a detailed, point-wise manner. Start each point with a bullet (•).\n\nUser Instruction: ${instruction}\n\nTranscript:\n${text}`;
 
-    const response = await axios.post(
+    const groqResponse = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: "llama-3.1-8b-instant",
-        messages: [
-          {
-            role: "system",
-            content: "You are a helpful assistant that generates summaries.",
-          },
-          { role: "user", content: userPrompt },
-        ],
-      },
-      {
+        method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
+        body: JSON.stringify({
+          model: "llama-3.1-8b-instant",
+          messages: [
+            {
+              role: "system",
+              content: "You are a helpful assistant that generates summaries.",
+            },
+            { role: "user", content: userPrompt },
+          ],
+          stream: true, // Tell Groq to stream the response
+        }),
       }
     );
 
-    const summary = response.data.choices[0].message.content;
-    res.json({ summary });
+    // Set headers for a Server-Sent Event (SSE) stream
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    // Stream the response from Groq directly to the client
+    groqResponse.body.on("data", (chunk) => {
+      const lines = chunk.toString().split("\n").filter(Boolean);
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          const json = line.substring(5).trim();
+          if (json === "[DONE]") {
+            res.end();
+            return;
+          }
+          try {
+            const data = JSON.parse(json);
+            const content = data.choices[0].delta.content;
+            if (content) {
+              res.write(`data: ${JSON.stringify({ content })}\n\n`);
+            }
+          } catch (e) {
+            console.error("Error parsing JSON:", e);
+          }
+        }
+      }
+    });
+
+    groqResponse.body.on("error", (err) => {
+      console.error("Groq stream error:", err);
+      res.end();
+    });
   } catch (error) {
-    console.error("Error summarizing:", error.response?.data || error.message);
+    console.error("Error summarizing:", error.message);
     res.status(500).json({ error: "Failed to summarize" });
   }
 });
 
-// Share via email (now sends a real email)
 app.post("/api/share-form", async (req, res) => {
   const { to, subject, text } = req.body;
 
@@ -84,7 +115,7 @@ app.post("/api/share-form", async (req, res) => {
     from: process.env.EMAIL_USER,
     to: to,
     subject: subject,
-    html: `<p>${text.replace(/\n/g, "<br>")}</p>`, // Convert newlines to HTML line breaks
+    html: `<p>${text.replace(/\n/g, "<br>")}</p>`,
   };
 
   try {
